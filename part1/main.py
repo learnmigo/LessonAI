@@ -1,3 +1,12 @@
+import asyncio
+import aiofiles
+import boto3
+import time
+import re
+import os
+
+from uuid import uuid4
+from loguru import logger
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -5,21 +14,37 @@ from fastapi.responses import FileResponse
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
-
 from openai import OpenAI
-import time
-import re
-import os
 
 from mangum import Mangum
+
 
 app = FastAPI()
 handler = Mangum(app)
 
 # Replace these values with your actual OpenAI credentials
-api_key = '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'
-assistant_id = 'asst_Sc75zGdT0g68oS03D3u0R47G'
+ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+SECRET_KEY = os.getenv("S3_SECRET_KEY")
+api_key = os.getenv("OPENAI_API_KEY")
+assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
+AWS_BUCKET = 'flow-doc-pdf-bucket-1'
+
+
 client = OpenAI(api_key=api_key)
+
+session = boto3.Session(
+    aws_access_key_id=ACCESS_KEY,      # Replace with your access key ID
+    aws_secret_access_key=SECRET_KEY,  # Replace with your secret access key
+    # aws_session_token=SESSION_TOKEN  # If using temporary credentials, else remove this line
+)
+
+s3 = session.resource('s3')
+bucket = s3.Bucket(AWS_BUCKET)
+
+async def s3_upload(content: bytes, key: str):
+  logger.info(f'Uploading {key} to s3')
+  bucket.put_object(Key=key, Body=content)
+
 
 class LearningOutcomeInput(BaseModel):
     topic: str
@@ -63,7 +88,7 @@ def format_text(input_text):
     
     return formatted_text
 
-def generate_pdf(input_text, output_path='/tmp/output.pdf'):
+async def generate_pdf(input_text, output_path='/tmp/output.pdf'):
     formatted_text = format_text(input_text)
     
     # Get the directory where the script is located
@@ -82,7 +107,22 @@ def generate_pdf(input_text, output_path='/tmp/output.pdf'):
     # Add paragraphs to the document
     doc.build(paragraphs)
     
-    return pdf_path
+    async with aiofiles.open(pdf_path, mode='rb') as f:
+      content = await f.read()
+    
+    # with open(pdf_path, 'rb') as f:
+    #   content_bytes = f.read()
+  
+    # content = content_bytes.decode('utf-8', errors='ignore')
+    # f = open(pdf_path, "r")
+    # content = f.read()
+    
+    file_type = "pdf"  # Use magic library to get file type 
+    s3_file_name = f'{uuid4()}.{file_type}'
+    
+    await s3_upload(content = content, key=s3_file_name)
+    
+    return s3_file_name
 
 @app.post("/assess")
 async def assess_outcomes(outcome_input: LearningOutcomeInput):
@@ -212,32 +252,23 @@ Give the output only in the following JSON format
     thread_info = {"thread_id": thread_id, "answers": answers}
     
     return JSONResponse(content=thread_info)
+  
+  
+async def asyncFlowDocThread(flow_input, learning_outcomes_data, total_sub_learning_outcomes, sub_learning_outcome, i, thread_ids, responses):
+  # Create a thread
+  thread_id = create_thread()
 
+  # Extract relevant information from the sub-learning outcome
+  sub_learning_outcome_text = sub_learning_outcome["outcome"]
+  # sub_learning_outcome_mode = sub_learning_outcome["modeOfDelivery"]
+  # sub_learning_outcome_time = sub_learning_outcome["timeRequired"]
 
-@app.post("/flow_doc_new")
-def create_flow_document_new(flow_input: FlowDocInput):
-    # Create a thread for each sub-learning outcome
-    thread_ids = []
-    responses = []
+  # Extract information about the next sub-learning outcome
+  next_sub_learning_outcome = learning_outcomes_data[0]["subLearningOutcomes"][(i + 1) % total_sub_learning_outcomes]
+  next_sub_learning_outcome_text = next_sub_learning_outcome["outcome"]
 
-    learning_outcomes_data = flow_input.learning_outcomes.get("learningOutcomes", {})
-    total_sub_learning_outcomes = len(learning_outcomes_data[0]["subLearningOutcomes"])
-
-    for i, sub_learning_outcome in enumerate(learning_outcomes_data[0]["subLearningOutcomes"]):
-        # Create a thread
-        thread_id = create_thread()
-
-        # Extract relevant information from the sub-learning outcome
-        sub_learning_outcome_text = sub_learning_outcome["outcome"]
-        # sub_learning_outcome_mode = sub_learning_outcome["modeOfDelivery"]
-        # sub_learning_outcome_time = sub_learning_outcome["timeRequired"]
-
-        # Extract information about the next sub-learning outcome
-        next_sub_learning_outcome = learning_outcomes_data[0]["subLearningOutcomes"][(i + 1) % total_sub_learning_outcomes]
-        next_sub_learning_outcome_text = next_sub_learning_outcome["outcome"]
-
-        # Construct prompt for the current sub-learning outcome
-        prompt = f"""Create a instructional design document for each of the sub-learning outcomes which are primarily based upon Gagne's levels of instructional design.
+  # Construct prompt for the current sub-learning outcome
+  prompt = f"""Create a instructional design document for each of the sub-learning outcomes which are primarily based upon Gagne's levels of instructional design.
 
 For each sub-learning objective create a 
 "Hook" - to Gain Attention of the Learner and Arouse Curiosity, 
@@ -262,7 +293,7 @@ Terminal Learning Outcome - Understanding Neural Networks
 Sub-Learning Outcome - Applications of Neural Network
 Next Sub-Learning Outcome - The analogy with Human brain
 
-THE OUTPUT IS EXPECTED IN THE FOLLOWING FORMAT
+THE OUTPUT IS EXPECTED IN THE FOLLOWING FORMAT ONLY MAKE SURE IT IS COVERING ALL BELOW HEADINGS
 Hook / Gain Attention:
 Engage learners by presenting a captivating scenario where they interact with SIRI, ALEXA, or Google Lens in their daily lives, highlighting the remarkable capabilities enabled by Neural Networks.
 
@@ -290,19 +321,39 @@ Encourage: Stimulate critical thinking by having learners apply knowledge.
 "Think about a real-life problem you could solve using Neural Networks and outline your approach."
 
 """
-        # Write the prompt to the thread
-        write_msg(prompt, thread_id)
+  # Write the prompt to the thread
+  write_msg(prompt, thread_id)
 
-        response = run_thread(assistant_id, thread_id)
-        responses.append(response)
+  response = run_thread(assistant_id, thread_id)
+  responses.append(response)
 
-        # Add the thread_id to the list
-        thread_ids.append(thread_id)
+  # Add the thread_id to the list
+  thread_ids.append(thread_id)
+  
+
+
+@app.post("/flow_doc_new")
+async def create_flow_document_new(flow_input: FlowDocInput):
+    # Create a thread for each sub-learning outcome
+    thread_ids = []
+    responses = []
+
+    learning_outcomes_data = flow_input.learning_outcomes.get("learningOutcomes", {})
+    total_sub_learning_outcomes = len(learning_outcomes_data[0]["subLearningOutcomes"])
+    print(learning_outcomes_data[0]["subLearningOutcomes"])
+    
+    async_tasks = []
+    for i, sub_learning_outcome in enumerate(learning_outcomes_data[0]["subLearningOutcomes"]):
+        async_tasks.append(asyncFlowDocThread(flow_input, learning_outcomes_data, total_sub_learning_outcomes, sub_learning_outcome, i, thread_ids, responses))
+        
+    await asyncio.gather(*async_tasks)
+ 
 
     # Wait for completion of each thread
     for i, response in enumerate(responses):
         j = 0
         while response.status.lower() != "completed":
+            print(response.status.lower())
             j = j + 1
             print(f"Thread {i + 1} - {j}...")
             response = client.beta.threads.runs.retrieve(run_id=response.id, thread_id=thread_ids[i])
@@ -313,35 +364,47 @@ Encourage: Stimulate critical thinking by having learners apply knowledge.
     answers_list = []
     answers=""
     final_answer = ""
+    sub_learning_outcome_list = []
     for i, thread_id in enumerate(thread_ids):
         query_response = client.beta.threads.messages.list(thread_id=thread_id)
         for answer in query_response:
             answers+=answer.content[0].text.value
             answers_list.append(answer.content[0].text.value)
-            final_answer += "**TERMINAL LEARNING OUTCOME:**\n"
-            print("TERMINAL LEARNING OUTCOME \n")
-            final_answer += f"{learning_outcomes_data[0]['terminalOutcome']}"
-            print(learning_outcomes_data[0]['terminalOutcome'])
-            final_answer += f"\n **SUB LEARNING OUTCOME-{i+1}:** \n"
-            print("SUB LEARNING OUTCOME -", i,"\n")
-            final_answer += f"{learning_outcomes_data[0]['subLearningOutcomes'][i]['outcome']}"
-            print(learning_outcomes_data[0]['subLearningOutcomes'][i]['outcome'])
-            final_answer += "\n **FLOW DOCUMENT:** \n"
-            print("FLOW DOCUMENT \n")
-            final_answer += f"{answer.content[0].text.value}"
-            print(answer.content[0].text.value)
-            final_answer +="\n\n\n\n"
-            final_answer +="________________________________________________________________________________"
-            final_answer +="\n\n\n\n"
+            subLearningOutcome = outcomeFormatter(learning_outcomes_data, answer, i)
+            final_answer += subLearningOutcome
+            sub_learning_outcome_list.append(subLearningOutcome)
             break
             
         # answers = [answer.content[0].text.value for answer in query_response]
         thread_responses.append({"thread_id": thread_id, "answers": answers})
 
-    pdf_path = generate_pdf(final_answer)
-    return FileResponse(pdf_path, filename='output.pdf', media_type='application/pdf')
+    s3_file_name = await generate_pdf(final_answer)
+    return {
+        "sub_learning_outcome_list": sub_learning_outcome_list,
+        "s3_file_name": s3_file_name
+      }
+    
+    
+def outcomeFormatter(learning_outcomes_data, answer, i):
+  final_answer = ""
+  final_answer += "**TERMINAL LEARNING OUTCOME:**\n"
+  print("TERMINAL LEARNING OUTCOME \n")
+  final_answer += f"{learning_outcomes_data[0]['terminalOutcome']}"
+  print(learning_outcomes_data[0]['terminalOutcome'])
+  final_answer += f"\n **SUB LEARNING OUTCOME-{i+1}:** \n"
+  print("SUB LEARNING OUTCOME -", i,"\n")
+  final_answer += f"{learning_outcomes_data[0]['subLearningOutcomes'][i]['outcome']}"
+  print(learning_outcomes_data[0]['subLearningOutcomes'][i]['outcome'])
+  final_answer += "\n **FLOW DOCUMENT:** \n"
+  print("FLOW DOCUMENT \n")
+  final_answer += f"{answer.content[0].text.value}"
+  print(answer.content[0].text.value)
+  final_answer +="\n\n\n\n"
+  final_answer +="________________________________________________________________________________"
+  final_answer +="\n\n\n\n"
+  return final_answer
 
 
-@app.get("/")
+@app.get("/home")
 def home():
     return {"message":"hello"}

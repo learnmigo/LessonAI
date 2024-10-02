@@ -1,20 +1,26 @@
+import asyncio
+import os
 import json
+import re
 import time
+import aiofiles
+import boto3
+import base64
+
+from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from openai import OpenAI
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-import json
-import requests
 from io import BytesIO
 from fastapi.responses import FileResponse
 from mangum import Mangum
 from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import quote_plus
-from pptx import Presentation
+from pptx import Presentation as Presentation_pptx
 from pptx.util import Inches, Pt
-from urllib.parse import quote_plus
+from PIL import Image, ImageDraw, ImageFont
+from loguru import logger
 
 app = FastAPI()
 handler = Mangum(app)
@@ -29,207 +35,276 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-assistant_id = 'asst_Sc75zGdT0g68oS03D3u0R47G'
-api_key = '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'
 query = """
-"Make a PPT presentation and a script which could be said alongside the presentation based on the following Instructional Design document. The output should be in a JSON FORMAT ONLY WITHOUT ANY EXPLANATORY TEXT AROUND IT which returns the slide title, slide content in bullet points, 2-3 keywords based on the slide content and the script which could be said by the teacher when the current slide is shown. Analyse the entire instructional design document and then create concise and legible ppts.
+# Make a PPT presentation and a script which could be said alongside the presentation based on the {sublearning_outcome} The output should be in a JSON FORMAT ONLY WITHOUT ANY EXPLANATORY TEXT AROUND IT which returns the slide title, slide content in bullet points, 2-3 keywords based on the slide content and the script which could be said by the teacher when the current slide is shown. 
 
-The ppt should have the following slides:
+# The ppt should have the following slides: 
+ 
+# Introduction slide which will use the hook/gain attention, establish relevance  and  Recall/Activate memory reparts of {sublearning_outcome}
 
-- Hook/ Gain Attention and Establish Relevance on one slide
-- Mention all the ""State Objectives"" on the next slide
-- Then create a slide for individual each ""State Objective""
-- Create a slide on how to ""Remember Concepts""
-- Summary + Priming for Next Topic
+# Objective slide which will contain mindmap {sublearning_outcome}
 
-THE SCRIPT SHOULD BE BASED ON THE CONTENT OF EACH SLIDE AND THE EXPLANATION GIVEN IN THE FLOW DOCUMENT
+# Demonstration slide which will contain th demonstration part of topic 
 
-THE RESPONSE SHOULD BE IN THE FOLLOWING JSON FORMAT ONLY. DO NOT ADD ANY EXPLANATORY TEXT BEFORE OR AFTER IT.
+# Practice assessments slide which will contain Practice Assessments 
 
-{
-  "slides": [
-    {
-      "title": "string",
-      "content": [
-        "string"
-      ],
-      "keywords": [
-        "string"
-      ],
-      "script": "string"
-    }
-  ]
-}
-EACH SLIDE WOULD BE A LIST ITEM IN THE ABOVE JSON: 
-TITLE - TITLE FOR THE SLIDE CONTENT
-CONTENT - 3 TO 5 BULLET POINTS EXPLAINING THE CONTENT
-KEYWORDS - 2 TO 3 SINGLE WORD KEYWORDS ABOUT THE ENTIRE SLIDE. THESE KEYWORDS WOULD BE USED TO SEARCH FOR IMAGES SO KEEP THEM APT
-SCRIPT - A COMPREHENSIVE SCRIPT TO GO ALONG WITH THE SLIDE WHICH EXPLAINS THE SLIDE IN DEPTH WITH ELLUSIVE EXAMPLES
+# Summary slide which contains Summary + Priming for Next Topic:
 
-"""
+# - 
+
+# THE SCRIPT SHOULD BE BASED ON THE CONTENT OF EACH SLIDE AND THE EXPLANATION GIVEN IN THE {sublearning_outcome}
+
+# THE RESPONSE SHOULD BE IN THE FOLLOWING JSON FORMAT ONLY. DO NOT ADD ANY EXPLANATORY TEXT BEFORE OR AFTER IT.
+
+# {
+#   "slides": [
+#     {
+#       "title": "string",
+#       "content": [
+#         "string"
+#       ],
+#       "keywords": [
+#         "string"
+#       ],
+#       "script": "string"
+#     }
+#   ]
+# }
+# EACH SLIDE WOULD BE A LIST ITEM IN THE ABOVE JSON: 
+# TITLE - TITLE FOR THE SLIDE CONTENT
+# CONTENT - 3 TO 5 BULLET POINTS EXPLAINING THE CONTENT
+# KEYWORDS - 2 TO 3 SINGLE WORD KEYWORDS ABOUT THE ENTIRE SLIDE. THESE KEYWORDS WOULD BE USED TO SEARCH FOR IMAGES SO KEEP THEM APT ALSO MAKE SURE KEYWORDS FOR EACH INDIVIDUAL SLIDES MUST BE DIFFERENT, THERE SHOULD NOT BE ANY REPEATING KEYWORDS
+# SCRIPT - A COMPREHENSIVE SCRIPT TO GO ALONG WITH THE SLIDE WHICH EXPLAINS THE SLIDE IN DEPTH WITH ELLUSIVE EXAMPLES
+
+# """
+
+ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+SECRET_KEY = os.getenv("S3_SECRET_KEY")
+api_key = os.getenv("OPENAI_API_KEY")
+assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
+AWS_BUCKET_THUMBNAIL = 'ppt-thumbnail-bucket-1'
+AWS_BUCKET_PPT = 'ppt-bucket-1'
+AWS_BUCKET_IMAGE = 'ppt-image-bucket-1'
+
 
 client = OpenAI(api_key=api_key)
 
-def create_thread():
-    # Create a thread
-    thread = client.beta.threads.create()
-    # Add the thread_id to the list
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY,
+)
+
+session = boto3.Session(
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY,
+)
+
+s3 = session.resource('s3')
+bucketThumbnail = s3.Bucket(AWS_BUCKET_THUMBNAIL)
+bucketPPT = s3.Bucket(AWS_BUCKET_PPT)
+bucketImage = s3.Bucket(AWS_BUCKET_IMAGE)
+
+async def s3_upload_thumbnail(content: bytes, key: str):
+    logger.info(f'Uploading thumbnail {key} to s3')
+    await asyncio.to_thread(bucketThumbnail.put_object, Key=key, Body=content)
+
+async def s3_upload_ppt(content: bytes, key: str):
+    logger.info(f'Uploading ppt {key} to s3')
+    await asyncio.to_thread(bucketPPT.put_object, Key=key, Body=content)
+
+async def s3_upload_image(content: bytes, key: str):
+    logger.info(f'Uploading image {key} to s3')
+    await asyncio.to_thread(bucketImage.put_object, Key=key, Body=content)
+
+async def s3_download_image_binary(key: str):
+    logger.info(f'Downloading Image {key} from s3')
+    try:
+        response = await asyncio.to_thread(s3_client.get_object, Bucket=AWS_BUCKET_IMAGE, Key=key)
+        base64_content = response['Body'].read().decode('utf-8')
+        decoded_content = base64.b64decode(base64_content)
+    except Exception as e:
+        logger.error(f"Error getting object {key} from bucket {AWS_BUCKET_IMAGE}. {e}")
+        return None
+    return decoded_content
+
+TEMP_DIR = "/tmp"
+
+async def create_thread():
+    thread = await asyncio.to_thread(client.beta.threads.create)
     thread_id = thread.id
-    print("THREAD CREATED!!!")
+    logger.info("THREAD CREATED!!!")
     return thread_id
 
-def run_thread(assistant_id, thread_id):
-    # Run the thread
-    response = client.beta.threads.runs.create(assistant_id=assistant_id, thread_id=thread_id)
-    print("THREAD RUN!!!")
+async def run_thread(assistant_id, thread_id):
+    response = await asyncio.to_thread(client.beta.threads.runs.create, assistant_id=assistant_id, thread_id=thread_id)
+    logger.info("THREAD RUN!!!")
     return response
 
-def write_msg(query, thread_id, file_id):
-    thread_message = client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=query,
-        file_ids=[file_id]
-    )
-    print(thread_message)
+async def write_msg(query, thread_id):
+    thread_message = await asyncio.to_thread(client.beta.threads.messages.create, thread_id=thread_id, role="user", content=query)
+    logger.info(thread_message)
 
 class Slide(BaseModel):
     title: str
     content: List[str]
     keywords: List[str]
     script: str
-    img: str = ""  # New field for storing image URL
+    image_s3: str = ""
 
 class Slides(BaseModel):
     slides: List[Slide]
     template: str
 
-# Function to search Unsplash images based on keywords
-def search_unsplash_images(keyword):
-    query = quote_plus(keyword.lower())
-    UNSPLASH_API_URL = f"https://api.unsplash.com/search/photos/?client_id=AcayKaf-dYHRjbRTrryO9Tf51Z8ann6UhfXDaAg_7rE&page=1&query={query}&per_page=1"
-    response = requests.get(UNSPLASH_API_URL)
-    data = json.loads(response.text)
-    if "results" in data and len(data["results"]) > 0:
-        return data["results"][0]["links"]["download"]
-    return None
+class JSONScriptInput(BaseModel):
+    subLearningOutcome: str
 
-def generate_ppt_doc(slide_formatted_data, template):  
-    # Fetch Images for Slides
+def format_text(input_text):
+    formatted_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', input_text)
+    return formatted_text
 
-    # slide_formatted_json = [json.loads(slide.json()) for slide in slide_formatted_data ]
-    # print(slide_formatted_json)
+async def generate_image(query, index):
+    query = f'Generate an Image: {query}'
+    logger.info(f"Slide: {index}")
+    logger.info(query)
+    response = await asyncio.to_thread(client.images.generate, model="dall-e-3", prompt=query, n=1, quality="standard", response_format="b64_json")
+    image_data = response.data[0].b64_json
+    key = f"{uuid4()}.txt"
+    await s3_upload_image(key=key, content=image_data)
+    return key
 
-    print("Images searching...")
-    for slide in slide_formatted_data:
+async def create_thumbnail(slide, ppt_file_path):
+    logger.info("Creating thumbnail")
+    img = Image.new("RGB", (1280, 720), color="white")
+    draw = ImageDraw.Draw(img)
+    font_file_path = "Gidole-Regular.ttf"
+    font_title_size = 50
+    font_content_size = 30
+    font_title = ImageFont.truetype(font_file_path, font_title_size)
+    font_content = ImageFont.truetype(font_file_path, font_content_size)
+    draw.text((100, 50), slide["title"], fill="black", font=font_title)
+    content_y = 150
+    for line in slide["content"]:
+        draw.text((100, content_y), "• " + line, fill="black", font=font_content)
+        content_y += 50
+    image_s3 = slide['image_s3']
+    if isinstance(image_s3, str) and image_s3:
+        try:
+            image_response = await s3_download_image_binary(key=image_s3)
+            if image_response:
+                image = Image.open(BytesIO(image_response))
+                image = image.resize((400, 300))
+                img.paste(image, (800, 350))
+        except Exception as e:
+            logger.error(f"Failed to fetch image: {e}")
+    uniqueID = uuid4()
+    img_file_name = f"{uniqueID}.jpg"
+    img_file_path = os.path.join(TEMP_DIR, img_file_name)
+    img.save(img_file_path)
+    async with aiofiles.open(img_file_path, mode='rb') as f:
+        content = await f.read()
+    await s3_upload_thumbnail(content, img_file_name)
+    return img_file_name
+
+async def generate_ppt_doc(slide_formatted_data, template):
+    fetch_image_tasks = []
+    for i, slide in enumerate(slide_formatted_data):
         if 'keywords' in slide:
             keywords = slide['keywords']
             combined_keywords = ' ,'.join(keywords)
-            image_url = search_unsplash_images(combined_keywords)
-            slide['image_url'] = image_url
-    
-    print("URLs Fetched")
-    # Create Presentation Object
-    prs = Presentation(f'./templates/{template}')
-
-    print("PPT Creation Started...")
-    # Iterate through JSON Slides to Create Presentation Slides
+            content = slide['content']
+            combined_content = ' ,'.join(content)
+            dallE_Query = "KeyWords: " + combined_keywords + " Content: " + combined_content
+            fetch_image_tasks.append(generate_image(dallE_Query, i))
+    image_results = await asyncio.gather(*fetch_image_tasks)
+    for slide, image_s3 in zip(slide_formatted_data, image_results):
+        if 'keywords' in slide:
+            slide['image_s3'] = image_s3
+    prs = Presentation_pptx(f'./templates/{template}')
     for slide_data in slide_formatted_data:
-        slide_layout = prs.slide_layouts[5]  # Use the layout suitable for content and picture
+        slide_layout = prs.slide_layouts[5]
         slide = prs.slides.add_slide(slide_layout)
-
-        # Set Title of the Slide
         title = slide.shapes.title
         title.text = slide_data['title']
-
-        # Add Content as Bullet Points in a Text Box
         left_content = slide.shapes.add_textbox(Inches(1.5), Inches(2), Inches(5.5), Inches(4))
         left_text_frame = left_content.text_frame
-
-        left_text_frame.word_wrap = True  # Ensure text box wraps content
-
-        # Add content to the slide
+        left_text_frame.word_wrap = True
         for text in slide_data['content']:
             p = left_text_frame.add_paragraph()
             p.text = text
-            p.font.size = Pt(18)  # Set font size to 18 points
-            p.space_after = Pt(12)  # Increase spacing between paragraphs
-            p.level = 0  # Set content as level 0 bullet points
-
-        # Add Image to the Slide if available
-        image_url = slide_data['image_url']
-        if isinstance(image_url, str) and image_url:
-            image_response = requests.get(image_url)
-            if image_response.status_code == 200:
-                image_stream = BytesIO(image_response.content)
-                left = Inches(7.5)
-                top = Inches(2.2)
-                width = height = Inches(4)
-                slide.shapes.add_picture(image_stream, left, top, width, height)
-
-    print("PPT Generated!!")
-
-    ppt_file_path = '/tmp/output_new.pptx'
+            p.font.size = Pt(18)
+            p.space_after = Pt(12)
+            p.level = 0
+        image_s3 = slide_data['image_s3']
+        if isinstance(image_s3, str) and image_s3:
+            try:
+                image_response = await s3_download_image_binary(key=image_s3)
+                if image_response:
+                    image_stream = BytesIO(image_response)
+                    left = Inches(7.5)
+                    top = Inches(2.2)
+                    width = height = Inches(4)
+                    slide.shapes.add_picture(image_stream, left, top, width, height)
+            except Exception as e:
+                logger.error(f"Failed to fetch image: {e}")
+    uniqueID = uuid4()
+    ppt_file_name = f'{uniqueID}.pptx'
+    ppt_file_path = f'/tmp/ppt_{ppt_file_name}'
     prs.save(ppt_file_path)
-
-    return FileResponse(path=ppt_file_path, media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
-
+    thumbnail_s3_file = await create_thumbnail(slide_formatted_data[0], ppt_file_path)
+    async with aiofiles.open(ppt_file_path, mode='rb') as f:
+        content = await f.read()
+    await s3_upload_ppt(content, ppt_file_name)
+    return {
+        "thumbnail": thumbnail_s3_file,
+        "ppt": ppt_file_name,
+        "slides": slide_formatted_data
+    }
 
 @app.post("/json_script")
-async def upload_file(template:str,file: UploadFile = File(...)):
+async def upload_file(input: JSONScriptInput):
     try:
-        thread_id = create_thread()
-        
-        file_content = await file.read()
-        file_id = client.files.create(file=file_content, purpose="assistants")
-        
-        write_msg(query, thread_id, file_id.id)
-
-        response = run_thread(assistant_id, thread_id)
-        
-        i=1
-        # Wait for the completion of the thread
+        sub_learning_outcome = input.subLearningOutcome
+        thread_id = await create_thread()
+        await write_msg(query + "\n Below is the given Sub-Learning Outcome: \n" + sub_learning_outcome, thread_id)
+        response = await run_thread(assistant_id, thread_id)
+        i = 1
         while response.status.lower() != "completed":
-            response = client.beta.threads.runs.retrieve(run_id=response.id, thread_id=thread_id)
-            time.sleep(1)
-            print(i)
-            i=i+1
-
-        # Retrieve and return the response
-        query_response = client.beta.threads.messages.list(thread_id=thread_id)
-        print(query_response)
+            response = await asyncio.to_thread(client.beta.threads.runs.retrieve, run_id=response.id, thread_id=thread_id)
+            await asyncio.sleep(1)
+            i += 1
+        query_response = await asyncio.to_thread(client.beta.threads.messages.list, thread_id=thread_id)
         for answer in query_response:
             response_text = answer.content[0].text.value
-            print(response_text)
             break
-
-        # Delete the file
-        client.files.delete(file_id.id)
-
-        # Find the index of the first '{' character
         start_index = response_text.find('{')
-
-        # Find the index of the last '}' character
-        end_index = response_text.rfind('}') + 1  # Adding 1 to include the last '}' character
-
-        # Extract JSON string
+        end_index = response_text.rfind('}') + 1
         json_str = response_text[start_index:end_index]
-
-        # Load JSON data
         json_data = json.loads(json_str)
-        ppt_file_path = generate_ppt_doc(json_data["slides"], template)
-
-        return json_data, ppt_file_path
-        # return JSONResponse(content={"json_response": json_data}, media_type="application/json"), FileResponse(path=ppt_file_path, media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
+        return json_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate Response: {str(e)}")
 
 @app.post("/generate_ppt")
 async def generate_ppt(slides: Slides):
     try:
-        print(slides.slides)
-        print(slides.template)
-        ppt = generate_ppt_doc(slides.slides, slides.template)
-        return ppt
+        slidesArr = []
+        for slide in slides.slides:
+            slideObj = {
+                "title": slide.title,
+                "content": slide.content,
+                "keywords": slide.keywords,
+                "script": slide.script,
+                "image_s3": slide.image_s3
+            }
+            slidesArr.append(slideObj)
+        ppt_result = await generate_ppt_doc(slidesArr, slides.template)
+        return ppt_result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate PPT: {str(e)}")
+
+@app.get("/")
+async def home():
+    return {
+        "msg": "Hello World!"
+    }
